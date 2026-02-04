@@ -1,57 +1,99 @@
+import { Ionicons } from '@expo/vector-icons';
+import { Tabs } from 'expo-router';
 import React from 'react';
-import FontAwesome from '@expo/vector-icons/FontAwesome';
-import { Link, Tabs } from 'expo-router';
-import { Pressable } from 'react-native';
+import { Platform, StyleSheet } from 'react-native';
+import { useColors, useTheme } from '../../context/ThemeContext';
 
-import Colors from '@/constants/Colors';
-import { useColorScheme } from '@/components/useColorScheme';
-import { useClientOnlyValue } from '@/components/useClientOnlyValue';
-
-// You can explore the built-in icon families and icons on the web at https://icons.expo.fyi/
 function TabBarIcon(props: {
-  name: React.ComponentProps<typeof FontAwesome>['name'];
+  name: React.ComponentProps<typeof Ionicons>['name'];
   color: string;
+  focused: boolean;
 }) {
-  return <FontAwesome size={28} style={{ marginBottom: -3 }} {...props} />;
+  return (
+    <Ionicons
+      size={28}
+      style={{ marginBottom: -4 }}
+      {...props}
+    />
+  );
 }
 
 export default function TabLayout() {
-  const colorScheme = useColorScheme();
+  const colors = useColors();
+  const { colorScheme } = useTheme();
 
   return (
     <Tabs
       screenOptions={{
-        tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
-        // Disable the static render of the header on web
-        // to prevent a hydration error in React Navigation v6.
-        headerShown: useClientOnlyValue(false, true),
-      }}>
+        tabBarActiveTintColor: colors.tint,
+        tabBarInactiveTintColor: colors.tabIconDefault,
+        tabBarStyle: {
+          position: 'absolute',
+          backgroundColor: colors.tabBarBackground,
+          borderTopColor: colors.separator,
+          borderTopWidth: StyleSheet.hairlineWidth,
+          paddingTop: 8,
+          paddingBottom: Platform.OS === 'ios' ? 28 : 12,
+          height: Platform.OS === 'ios' ? 88 : 68,
+          // Glassmorphism effect for web
+          ...(Platform.OS === 'web' && {
+            backdropFilter: 'blur(20px)',
+            WebkitBackdropFilter: 'blur(20px)',
+          }),
+        },
+        tabBarLabelStyle: {
+          fontSize: 10,
+          fontWeight: '500',
+          letterSpacing: -0.2,
+        },
+        tabBarIconStyle: {
+          marginTop: 2,
+        },
+        headerStyle: {
+          backgroundColor: colors.tabBarBackground,
+          borderBottomColor: colors.separator,
+          borderBottomWidth: StyleSheet.hairlineWidth,
+          // Glassmorphism for web
+          ...(Platform.OS === 'web' && {
+            backdropFilter: 'blur(20px)',
+            WebkitBackdropFilter: 'blur(20px)',
+          }),
+        },
+        headerTitleStyle: {
+          fontWeight: '600',
+          fontSize: 17,
+          color: colors.text,
+          letterSpacing: -0.4,
+        },
+        headerTintColor: colors.tint,
+        headerShadowVisible: false,
+      }}
+    >
       <Tabs.Screen
         name="index"
         options={{
-          title: 'Tab One',
-          tabBarIcon: ({ color }) => <TabBarIcon name="code" color={color} />,
-          headerRight: () => (
-            <Link href="/modal" asChild>
-              <Pressable>
-                {({ pressed }) => (
-                  <FontAwesome
-                    name="info-circle"
-                    size={25}
-                    color={Colors[colorScheme ?? 'light'].text}
-                    style={{ marginRight: 15, opacity: pressed ? 0.5 : 1 }}
-                  />
-                )}
-              </Pressable>
-            </Link>
+          title: 'Messages',
+          headerShown: false,
+          tabBarIcon: ({ color, focused }) => (
+            <TabBarIcon
+              name={focused ? "chatbubble-ellipses" : "chatbubble-ellipses-outline"}
+              color={color}
+              focused={focused}
+            />
           ),
         }}
       />
       <Tabs.Screen
-        name="two"
+        name="profile"
         options={{
-          title: 'Tab Two',
-          tabBarIcon: ({ color }) => <TabBarIcon name="code" color={color} />,
+          title: 'Settings',
+          tabBarIcon: ({ color, focused }) => (
+            <TabBarIcon
+              name={focused ? "settings" : "settings-outline"}
+              color={color}
+              focused={focused}
+            />
+          ),
         }}
       />
     </Tabs>
