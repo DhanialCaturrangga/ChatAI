@@ -2,6 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useNavigation } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+    Alert,
     Animated,
     FlatList,
     KeyboardAvoidingView,
@@ -10,21 +11,13 @@ import {
     Text,
     TextInput,
     TouchableOpacity,
-    View,
+    View
 } from 'react-native';
 import ChatBubble from '../../components/ChatBubble';
 import TypingIndicator from '../../components/TypingIndicator';
 import { useColors } from '../../context/ThemeContext';
 import { conversations, Message } from '../../data/mockData';
-
-const AI_RESPONSES = [
-    "That's a great question! Let me think about that for a moment...",
-    "I understand what you mean. Here's my perspective on that.",
-    "Interesting! I'd love to help you explore that topic further.",
-    "Thanks for sharing that. Here's what I think might work well for you.",
-    "That's a fascinating topic! Let me share some insights.",
-    "I appreciate your thoughtful question. Here's a detailed response.",
-];
+import { sendMessageToAI } from '../../services/api';
 
 export default function ChatDetailScreen() {
     const colors = useColors();
@@ -76,13 +69,14 @@ export default function ChatDetailScreen() {
         }, 100);
     }, []);
 
-    const sendMessage = () => {
+    const sendMessage = async () => {
         if (!inputText.trim()) return;
 
+        const userMessageText = inputText.trim();
         const newMessageId = `msg-${Date.now()}`;
         const newMessage: Message = {
             id: newMessageId,
-            text: inputText.trim(),
+            text: userMessageText,
             isUser: true,
             timestamp: new Date(),
         };
@@ -103,13 +97,16 @@ export default function ChatDetailScreen() {
 
         setIsTyping(true);
 
-        setTimeout(() => {
-            const aiMessageId = `msg-ai-${Date.now()}`;
-            const aiResponse = AI_RESPONSES[Math.floor(Math.random() * AI_RESPONSES.length)];
+        try {
+            // Call real Gemini AI API
+            const result = await sendMessageToAI(userMessageText, id);
 
+            const aiMessageId = `msg-ai-${Date.now()}`;
             const aiMessage: Message = {
                 id: aiMessageId,
-                text: aiResponse,
+                text: result.success
+                    ? result.response || 'Maaf, saya tidak bisa merespons saat ini.'
+                    : result.error || 'Terjadi kesalahan. Silakan coba lagi.',
                 isUser: false,
                 timestamp: new Date(),
             };
@@ -127,7 +124,40 @@ export default function ChatDetailScreen() {
                 tension: 50,
                 useNativeDriver: true,
             }).start();
-        }, 1200 + Math.random() * 800);
+
+            // Show alert if there was an error
+            if (!result.success) {
+                Alert.alert(
+                    'Error',
+                    result.error || 'Tidak dapat terhubung ke AI. Pastikan backend berjalan.',
+                    [{ text: 'OK' }]
+                );
+            }
+        } catch (error) {
+            setIsTyping(false);
+            console.error('Error sending message:', error);
+
+            const errorMessageId = `msg-error-${Date.now()}`;
+            const errorMessage: Message = {
+                id: errorMessageId,
+                text: '❌ Tidak dapat terhubung ke server. Pastikan backend sudah berjalan.',
+                isUser: false,
+                timestamp: new Date(),
+            };
+
+            const errorAnimValue = new Animated.Value(0);
+            messageAnimations.current.set(errorMessageId, errorAnimValue);
+
+            setMessages(prev => [...prev, errorMessage]);
+            scrollToBottom();
+
+            Animated.spring(errorAnimValue, {
+                toValue: 1,
+                friction: 8,
+                tension: 50,
+                useNativeDriver: true,
+            }).start();
+        }
     };
 
     const renderMessage = ({ item, index }: { item: Message; index: number }) => {

@@ -1,0 +1,15 @@
+// Configuration for ChatAI app
+
+// API Configuration
+// For local development: 'http://localhost:3001'
+// For production: Replace with your deployed backend URL (e.g., Railway, Render, Vercel)
+export const API_BASE_URL = 'http://localhost:3001';
+
+// For web/Expo Go, use your computer's IP address instead of localhost
+// Example: 'http://192.168.1.100:3001'
+// You can find your IP using 'ipconfig' (Windows) or 'ifconfig' (Mac/Linux)
+
+export const API_ENDPOINTS = {
+    chat: `${API_BASE_URL}/api/chat`,
+    health: `${API_BASE_URL}/api/health`,
+};
