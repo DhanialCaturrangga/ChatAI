@@ -84,6 +84,20 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
+        name="digest"
+        options={{
+          title: 'Digest',
+          headerShown: false,
+          tabBarIcon: ({ color, focused }) => (
+            <TabBarIcon
+              name={focused ? "newspaper" : "newspaper-outline"}
+              color={color}
+              focused={focused}
+            />
+          ),
+        }}
+      />
+      <Tabs.Screen
         name="profile"
         options={{
           title: 'Settings',

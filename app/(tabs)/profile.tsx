@@ -1,4 +1,5 @@
 import { Ionicons } from '@expo/vector-icons';
+import { router } from 'expo-router';
 import React from 'react';
 import {
     Alert,
@@ -105,6 +106,13 @@ export default function ProfileScreen() {
             </View>
 
             <View style={[styles.section, { backgroundColor: colors.cardSolid }]}>
+                <ProfileMenuItem
+                    icon="newspaper"
+                    iconBackgroundColor="#007AFF"
+                    label="Daily Digest"
+                    value="Berita AI"
+                    onPress={() => router.push('/digest-settings' as any)}
+                />
                 <ProfileMenuItem
                     icon="notifications"
                     iconBackgroundColor="#FF3B30"
