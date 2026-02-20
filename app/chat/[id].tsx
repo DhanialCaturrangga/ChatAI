@@ -2,8 +2,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useNavigation } from 'expo-router';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-    Alert,
-    Animated,
+    AppState,
     FlatList,
     KeyboardAvoidingView,
     Platform,
@@ -11,35 +10,71 @@ import {
     Text,
     TextInput,
     TouchableOpacity,
-    View
+    View,
 } from 'react-native';
-import ChatBubble from '../../components/ChatBubble';
-import TypingIndicator from '../../components/TypingIndicator';
+import { useAuth } from '../../context/AuthContext';
 import { useColors } from '../../context/ThemeContext';
-import { conversations, Message } from '../../data/mockData';
-import { sendMessageToAI } from '../../services/api';
+import supabase from '../../lib/supabase';
+
+interface ChatMessage {
+    id: string;
+    room_id: string;
+    user_id: string;
+    content: string;
+    created_at: string;
+    profiles?: { username: string; full_name: string };
+}
+
+interface TypingUser {
+    userId: string;
+    username: string;
+}
+
+interface OnlineUser {
+    userId: string;
+    username: string;
+    onlineAt: string;
+}
 
 export default function ChatDetailScreen() {
     const colors = useColors();
-    const { id } = useLocalSearchParams<{ id: string }>();
+    const { id: roomId } = useLocalSearchParams<{ id: string }>();
     const navigation = useNavigation();
+    const { user, profile } = useAuth();
     const flatListRef = useRef<FlatList>(null);
 
-    const conversation = conversations.find(c => c.id === id);
-    const [messages, setMessages] = useState<Message[]>(conversation?.messages || []);
+    const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [inputText, setInputText] = useState('');
-    const [isTyping, setIsTyping] = useState(false);
+    const [roomName, setRoomName] = useState('Chat');
+    const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
+    const [onlineUsers, setOnlineUsers] = useState<OnlineUser[]>([]);
+    const [loading, setLoading] = useState(true);
 
-    const messageAnimations = useRef<Map<string, Animated.Value>>(new Map());
+    const channelRef = useRef<any>(null);
+    const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+    // Fetch room info
     useEffect(() => {
-        const title = conversation?.title || 'New Message';
+        if (!roomId) return;
+        supabase
+            .from('rooms')
+            .select('name')
+            .eq('id', roomId)
+            .single()
+            .then(({ data }) => {
+                if (data?.name) {
+                    setRoomName(data.name);
+                }
+            });
+    }, [roomId]);
+
+    // Set header
+    useEffect(() => {
+        const onlineCount = onlineUsers.length;
         navigation.setOptions({
-            title: title,
+            title: roomName,
             headerBackTitle: 'Back',
-            headerStyle: {
-                backgroundColor: colors.tabBarBackground,
-            },
+            headerStyle: { backgroundColor: colors.tabBarBackground },
             headerTintColor: colors.tint,
             headerTitleStyle: {
                 color: colors.text,
@@ -49,141 +84,265 @@ export default function ChatDetailScreen() {
             },
             headerShadowVisible: false,
             headerRight: () => (
-                <TouchableOpacity style={styles.headerRight} activeOpacity={0.6}>
-                    <Ionicons name="videocam" size={26} color={colors.tint} />
-                </TouchableOpacity>
+                <View style={styles.headerRight}>
+                    {onlineCount > 0 && (
+                        <View style={styles.onlineBadge}>
+                            <View style={[styles.onlineDot, { backgroundColor: colors.success }]} />
+                            <Text style={[styles.onlineText, { color: colors.textSecondary }]}>
+                                {onlineCount}
+                            </Text>
+                        </View>
+                    )}
+                </View>
             ),
         });
-    }, [navigation, conversation, colors]);
+    }, [navigation, roomName, colors, onlineUsers]);
 
-    const getAnimatedValue = (messageId: string): Animated.Value => {
-        if (!messageAnimations.current.has(messageId)) {
-            messageAnimations.current.set(messageId, new Animated.Value(1));
+    // Fetch messages
+    const fetchMessages = useCallback(async () => {
+        if (!roomId) return;
+        try {
+            const { data } = await supabase
+                .from('messages')
+                .select('*, profiles:user_id(username, full_name)')
+                .eq('room_id', roomId)
+                .order('created_at', { ascending: true });
+
+            if (data) setMessages(data);
+        } catch (error) {
+            console.error('Error fetching messages:', error);
+        } finally {
+            setLoading(false);
         }
-        return messageAnimations.current.get(messageId)!;
-    };
+    }, [roomId]);
 
+    useEffect(() => {
+        fetchMessages();
+    }, [fetchMessages]);
+
+    // Re-fetch on foreground
+    useEffect(() => {
+        const subscription = AppState.addEventListener('change', (state) => {
+            if (state === 'active') fetchMessages();
+        });
+        return () => subscription.remove();
+    }, [fetchMessages]);
+
+    // Real-time: Live messages + Typing + Presence
+    useEffect(() => {
+        if (!roomId || !user) return;
+
+        const channel = supabase.channel(`room:${roomId}`, {
+            config: { presence: { key: user.id } },
+        });
+
+        // A. Live Messages (Postgres Changes)
+        channel.on(
+            'postgres_changes',
+            {
+                event: 'INSERT',
+                schema: 'public',
+                table: 'messages',
+                filter: `room_id=eq.${roomId}`,
+            },
+            async (payload: any) => {
+                // Fetch profile for the new message
+                const { data: profileData } = await supabase
+                    .from('profiles')
+                    .select('username, full_name')
+                    .eq('id', payload.new.user_id)
+                    .single();
+
+                const newMsg: ChatMessage = {
+                    ...payload.new,
+                    profiles: profileData || undefined,
+                };
+                setMessages(prev => [...prev, newMsg]);
+            }
+        );
+
+        // B. Typing Indicator (Broadcast)
+        channel.on('broadcast', { event: 'typing' }, (payload: any) => {
+            const { userId, username, isTyping } = payload.payload;
+            if (userId === user.id) return; // Ignore own typing
+
+            setTypingUsers(prev => {
+                if (isTyping) {
+                    if (prev.find(u => u.userId === userId)) return prev;
+                    return [...prev, { userId, username }];
+                } else {
+                    return prev.filter(u => u.userId !== userId);
+                }
+            });
+        });
+
+        // C. Online Status (Presence)
+        channel.on('presence', { event: 'sync' }, () => {
+            const state = channel.presenceState();
+            const users: OnlineUser[] = [];
+            Object.values(state).forEach((presences: any) => {
+                presences.forEach((p: any) => {
+                    users.push({
+                        userId: p.userId,
+                        username: p.username,
+                        onlineAt: p.onlineAt,
+                    });
+                });
+            });
+            setOnlineUsers(users);
+        });
+
+        channel.subscribe(async (status: string) => {
+            if (status === 'SUBSCRIBED') {
+                // Track presence
+                await channel.track({
+                    userId: user.id,
+                    username: profile?.username || user.email?.split('@')[0] || 'User',
+                    onlineAt: new Date().toISOString(),
+                });
+            }
+        });
+
+        channelRef.current = channel;
+
+        // IMPORTANT: Proper cleanup with removeChannel
+        return () => {
+            supabase.removeChannel(channel);
+            channelRef.current = null;
+        };
+    }, [roomId, user, profile]);
+
+    // Scroll to bottom
     const scrollToBottom = useCallback(() => {
         setTimeout(() => {
             flatListRef.current?.scrollToEnd({ animated: true });
         }, 100);
     }, []);
 
+    useEffect(() => {
+        if (messages.length > 0) scrollToBottom();
+    }, [messages.length, scrollToBottom]);
+
+    // Send typing indicator
+    const sendTypingIndicator = (isTyping: boolean) => {
+        channelRef.current?.send({
+            type: 'broadcast',
+            event: 'typing',
+            payload: {
+                userId: user?.id,
+                username: profile?.username || user?.email?.split('@')[0] || 'User',
+                isTyping,
+            },
+        });
+    };
+
+    const handleTextChange = (text: string) => {
+        setInputText(text);
+
+        // Send typing start
+        sendTypingIndicator(true);
+
+        // Clear previous timeout
+        if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+
+        // Send typing stop after 2 seconds of inactivity
+        typingTimeoutRef.current = setTimeout(() => {
+            sendTypingIndicator(false);
+        }, 2000);
+    };
+
+    // Send message
     const sendMessage = async () => {
-        if (!inputText.trim()) return;
+        if (!inputText.trim() || !user || !roomId) return;
 
-        const userMessageText = inputText.trim();
-        const newMessageId = `msg-${Date.now()}`;
-        const newMessage: Message = {
-            id: newMessageId,
-            text: userMessageText,
-            isUser: true,
-            timestamp: new Date(),
-        };
-
-        const animValue = new Animated.Value(0);
-        messageAnimations.current.set(newMessageId, animValue);
-
-        setMessages(prev => [...prev, newMessage]);
+        const messageText = inputText.trim();
         setInputText('');
-        scrollToBottom();
-
-        Animated.spring(animValue, {
-            toValue: 1,
-            friction: 8,
-            tension: 50,
-            useNativeDriver: true,
-        }).start();
-
-        setIsTyping(true);
+        sendTypingIndicator(false);
 
         try {
-            // Call real Gemini AI API
-            const result = await sendMessageToAI(userMessageText, id);
+            const { error } = await supabase.from('messages').insert({
+                room_id: roomId,
+                user_id: user.id,
+                content: messageText,
+            });
 
-            const aiMessageId = `msg-ai-${Date.now()}`;
-            const aiMessage: Message = {
-                id: aiMessageId,
-                text: result.success
-                    ? result.response || 'Maaf, saya tidak bisa merespons saat ini.'
-                    : result.error || 'Terjadi kesalahan. Silakan coba lagi.',
-                isUser: false,
-                timestamp: new Date(),
-            };
-
-            const aiAnimValue = new Animated.Value(0);
-            messageAnimations.current.set(aiMessageId, aiAnimValue);
-
-            setIsTyping(false);
-            setMessages(prev => [...prev, aiMessage]);
-            scrollToBottom();
-
-            Animated.spring(aiAnimValue, {
-                toValue: 1,
-                friction: 8,
-                tension: 50,
-                useNativeDriver: true,
-            }).start();
-
-            // Show alert if there was an error
-            if (!result.success) {
-                Alert.alert(
-                    'Error',
-                    result.error || 'Tidak dapat terhubung ke AI. Pastikan backend berjalan.',
-                    [{ text: 'OK' }]
-                );
-            }
+            if (error) throw error;
         } catch (error) {
-            setIsTyping(false);
             console.error('Error sending message:', error);
-
-            const errorMessageId = `msg-error-${Date.now()}`;
-            const errorMessage: Message = {
-                id: errorMessageId,
-                text: '❌ Tidak dapat terhubung ke server. Pastikan backend sudah berjalan.',
-                isUser: false,
-                timestamp: new Date(),
-            };
-
-            const errorAnimValue = new Animated.Value(0);
-            messageAnimations.current.set(errorMessageId, errorAnimValue);
-
-            setMessages(prev => [...prev, errorMessage]);
-            scrollToBottom();
-
-            Animated.spring(errorAnimValue, {
-                toValue: 1,
-                friction: 8,
-                tension: 50,
-                useNativeDriver: true,
-            }).start();
+            setInputText(messageText); // Restore input on error
         }
     };
 
-    const renderMessage = ({ item, index }: { item: Message; index: number }) => {
-        const isRecent = index >= messages.length - 2;
-        const animatedValue = isRecent ? getAnimatedValue(item.id) : undefined;
-        const isLastInGroup = index === messages.length - 1 ||
-            (messages[index + 1]?.isUser !== item.isUser);
+    const formatTime = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleTimeString('en-US', {
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true,
+        });
+    };
+
+    const renderMessage = ({ item }: { item: ChatMessage }) => {
+        const isOwnMessage = item.user_id === user?.id;
+        const senderName = item.profiles?.username || item.profiles?.full_name || 'User';
 
         return (
-            <ChatBubble
-                message={item}
-                showTimestamp={isLastInGroup}
-                animatedValue={animatedValue}
-                isLastInGroup={isLastInGroup}
-            />
+            <View style={[
+                styles.messageBubbleContainer,
+                isOwnMessage ? styles.ownMessage : styles.otherMessage,
+            ]}>
+                {!isOwnMessage && (
+                    <Text style={[styles.senderName, { color: colors.tint }]}>
+                        {senderName}
+                    </Text>
+                )}
+                <View style={[
+                    styles.bubble,
+                    {
+                        backgroundColor: isOwnMessage ? colors.userBubble : colors.aiBubble,
+                    },
+                ]}>
+                    <Text style={[
+                        styles.messageText,
+                        { color: isOwnMessage ? colors.userBubbleText : colors.aiBubbleText },
+                    ]}>
+                        {item.content}
+                    </Text>
+                </View>
+                <Text style={[styles.timestamp, { color: colors.textTertiary }]}>
+                    {formatTime(item.created_at)}
+                </Text>
+            </View>
         );
     };
 
-    const renderEmptyChat = () => (
+    const renderTypingIndicator = () => {
+        if (typingUsers.length === 0) return null;
+        const names = typingUsers.map(u => u.username).join(', ');
+        return (
+            <View style={styles.typingContainer}>
+                <View style={[styles.typingBubble, { backgroundColor: colors.aiBubble }]}>
+                    <View style={styles.typingDots}>
+                        <View style={[styles.dot, styles.dot1, { backgroundColor: colors.textTertiary }]} />
+                        <View style={[styles.dot, styles.dot2, { backgroundColor: colors.textTertiary }]} />
+                        <View style={[styles.dot, styles.dot3, { backgroundColor: colors.textTertiary }]} />
+                    </View>
+                </View>
+                <Text style={[styles.typingText, { color: colors.textTertiary }]}>
+                    {names} {typingUsers.length === 1 ? 'is' : 'are'} typing...
+                </Text>
+            </View>
+        );
+    };
+
+    const renderEmpty = () => (
         <View style={styles.emptyContainer}>
             <View style={[styles.emptyIcon, { backgroundColor: colors.inputBackground }]}>
-                <Text style={styles.emptyEmoji}>🤖</Text>
+                <Text style={styles.emptyEmoji}>💬</Text>
             </View>
-            <Text style={[styles.emptyTitle, { color: colors.text }]}>AI Assistant</Text>
+            <Text style={[styles.emptyTitle, { color: colors.text }]}>{roomName}</Text>
             <Text style={[styles.emptySubtitle, { color: colors.textSecondary }]}>
-                Send a message to start the conversation. I'm here to help!
+                Send a message to start the conversation!
             </Text>
         </View>
     );
@@ -205,13 +364,23 @@ export default function ChatDetailScreen() {
                     styles.messageList,
                     messages.length === 0 && styles.emptyList,
                 ]}
-                ListEmptyComponent={renderEmptyChat}
-                ListFooterComponent={<TypingIndicator isVisible={isTyping} />}
+                ListEmptyComponent={!loading ? renderEmpty : null}
+                ListFooterComponent={renderTypingIndicator}
                 onContentSizeChange={scrollToBottom}
                 showsVerticalScrollIndicator={false}
             />
 
-            {/* iOS Messages style input bar */}
+            {/* Online users strip */}
+            {onlineUsers.length > 0 && (
+                <View style={[styles.onlineStrip, { backgroundColor: colors.cardSolid, borderTopColor: colors.separator }]}>
+                    <View style={[styles.onlineDot, { backgroundColor: colors.success }]} />
+                    <Text style={[styles.onlineStripText, { color: colors.textSecondary }]}>
+                        {onlineUsers.length} online: {onlineUsers.map(u => u.username).join(', ')}
+                    </Text>
+                </View>
+            )}
+
+            {/* Input bar */}
             <View style={[
                 styles.inputContainer,
                 {
@@ -219,12 +388,6 @@ export default function ChatDetailScreen() {
                     borderTopColor: colors.separator,
                 }
             ]}>
-                {/* Plus button */}
-                <TouchableOpacity style={styles.iconButton} activeOpacity={0.6}>
-                    <Ionicons name="add-circle" size={32} color={colors.tint} />
-                </TouchableOpacity>
-
-                {/* Input field */}
                 <View style={[
                     styles.inputWrapper,
                     {
@@ -234,16 +397,15 @@ export default function ChatDetailScreen() {
                 ]}>
                     <TextInput
                         style={[styles.input, { color: colors.text }]}
-                        placeholder="iMessage"
+                        placeholder="Message"
                         placeholderTextColor={colors.inputPlaceholder}
                         value={inputText}
-                        onChangeText={setInputText}
+                        onChangeText={handleTextChange}
                         multiline
-                        maxLength={1000}
+                        maxLength={2000}
                     />
                 </View>
 
-                {/* Send button */}
                 {canSend ? (
                     <TouchableOpacity
                         style={styles.sendButton}
@@ -263,49 +425,98 @@ export default function ChatDetailScreen() {
 }
 
 const styles = StyleSheet.create({
-    container: {
-        flex: 1,
-    },
+    container: { flex: 1 },
     headerRight: {
-        marginRight: 8,
-        padding: 4,
-    },
-    messageList: {
-        paddingVertical: 16,
-    },
-    emptyList: {
-        flex: 1,
-        justifyContent: 'center',
-    },
-    emptyContainer: {
-        flex: 1,
-        justifyContent: 'center',
+        flexDirection: 'row',
         alignItems: 'center',
+        marginRight: 8,
+        gap: 8,
+    },
+    onlineBadge: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 4,
+        paddingHorizontal: 8,
+        paddingVertical: 4,
+        borderRadius: 12,
+    },
+    onlineDot: {
+        width: 8, height: 8, borderRadius: 4,
+    },
+    onlineText: { fontSize: 13, fontWeight: '500' },
+    messageList: { paddingVertical: 16, paddingHorizontal: 12 },
+    emptyList: { flex: 1, justifyContent: 'center' },
+    emptyContainer: {
+        flex: 1, justifyContent: 'center', alignItems: 'center',
         paddingHorizontal: 40,
     },
     emptyIcon: {
-        width: 80,
-        height: 80,
-        borderRadius: 40,
-        justifyContent: 'center',
-        alignItems: 'center',
-        marginBottom: 16,
+        width: 80, height: 80, borderRadius: 40,
+        justifyContent: 'center', alignItems: 'center', marginBottom: 16,
     },
-    emptyEmoji: {
-        fontSize: 40,
-    },
+    emptyEmoji: { fontSize: 40 },
     emptyTitle: {
-        fontSize: 20,
-        fontWeight: '600',
-        marginBottom: 8,
-        letterSpacing: -0.4,
+        fontSize: 20, fontWeight: '600', marginBottom: 8, letterSpacing: -0.4,
     },
     emptySubtitle: {
-        fontSize: 15,
-        textAlign: 'center',
-        lineHeight: 20,
-        letterSpacing: -0.2,
+        fontSize: 15, textAlign: 'center', lineHeight: 20, letterSpacing: -0.2,
     },
+    messageBubbleContainer: {
+        marginBottom: 8,
+        maxWidth: '80%',
+    },
+    ownMessage: { alignSelf: 'flex-end', alignItems: 'flex-end' },
+    otherMessage: { alignSelf: 'flex-start', alignItems: 'flex-start' },
+    senderName: {
+        fontSize: 12, fontWeight: '600',
+        marginBottom: 2, marginLeft: 12, letterSpacing: -0.2,
+    },
+    bubble: {
+        paddingHorizontal: 14,
+        paddingVertical: 10,
+        borderRadius: 18,
+    },
+    messageText: {
+        fontSize: 16, lineHeight: 22, letterSpacing: -0.3,
+    },
+    timestamp: {
+        fontSize: 11, marginTop: 4, marginHorizontal: 8,
+    },
+    // Typing indicator
+    typingContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingHorizontal: 12,
+        paddingVertical: 4,
+        gap: 8,
+    },
+    typingBubble: {
+        paddingHorizontal: 14,
+        paddingVertical: 10,
+        borderRadius: 18,
+    },
+    typingDots: {
+        flexDirection: 'row',
+        gap: 4,
+    },
+    dot: {
+        width: 7, height: 7, borderRadius: 3.5,
+    },
+    dot1: { opacity: 0.4 },
+    dot2: { opacity: 0.6 },
+    dot3: { opacity: 0.8 },
+    typingText: { fontSize: 12, fontStyle: 'italic' },
+    // Online strip
+    onlineStrip: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        paddingHorizontal: 16,
+        paddingVertical: 6,
+        gap: 6,
+        borderTopWidth: StyleSheet.hairlineWidth,
+    },
+    onlineStripText: { fontSize: 12 },
+    // Input
     inputContainer: {
         flexDirection: 'row',
         alignItems: 'flex-end',
@@ -314,17 +525,10 @@ const styles = StyleSheet.create({
         paddingBottom: Platform.OS === 'ios' ? 34 : 12,
         borderTopWidth: StyleSheet.hairlineWidth,
         gap: 6,
-        // Glassmorphism for web
-        ...(Platform.OS === 'web' && {
-            backdropFilter: 'blur(20px)',
-            WebkitBackdropFilter: 'blur(20px)',
-        }),
     },
     iconButton: {
-        width: 36,
-        height: 36,
-        justifyContent: 'center',
-        alignItems: 'center',
+        width: 36, height: 36,
+        justifyContent: 'center', alignItems: 'center',
     },
     inputWrapper: {
         flex: 1,
@@ -336,15 +540,11 @@ const styles = StyleSheet.create({
         maxHeight: 100,
     },
     input: {
-        fontSize: 17,
-        lineHeight: 22,
-        letterSpacing: -0.4,
-        maxHeight: 84,
+        fontSize: 17, lineHeight: 22,
+        letterSpacing: -0.4, maxHeight: 84,
     },
     sendButton: {
-        width: 36,
-        height: 36,
-        justifyContent: 'center',
-        alignItems: 'center',
+        width: 36, height: 36,
+        justifyContent: 'center', alignItems: 'center',
     },
 });
